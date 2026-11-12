@@ -1,0 +1,923 @@
+// ==UserScript==
+// @name         Blogger Reading List — Cleaner Edition
+// @namespace    https://local.userscripts.example/blogger-reading-list
+// @version      0.5.0
+// @description  readable dark mode, live topic/keyword/author search, wallpaper import, original links and read tracking.
+// @match        https://www.blogger.com/*
+// @match        https://blogger.com/*
+// @match        https://draft.blogger.com/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+(() => {
+  'use strict';
+
+  const PREFIX = 'brr-v1-';
+  const OPT_KEY = PREFIX + 'options';
+  const READ_KEY = PREFIX + 'read';
+  const IMAGE_KEY = PREFIX + 'custom-background';
+  // A locally imported pattern stays in this browser; the image is not uploaded anywhere.
+  let storedPattern = null;
+  let appliedPattern = undefined;
+  try {
+    const value = localStorage.getItem(IMAGE_KEY);
+    if (value && /^data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(value)) {
+      storedPattern = value;
+    }
+  } catch { /* storage unavailable */ }
+
+  const DEFAULTS = { clean: true, pattern: true, visiblePattern: true, dark: false, hideRead: false };
+
+  function load(key, fallback) {
+    try {
+      const value = JSON.parse(localStorage.getItem(key));
+      return value && typeof value === 'object' ? value : fallback;
+    } catch { return fallback; }
+  }
+  const options = { ...DEFAULTS, ...load(OPT_KEY, DEFAULTS) };
+  const read = load(READ_KEY, {});
+  const saveOptions = () => { try { localStorage.setItem(OPT_KEY, JSON.stringify(options)); } catch { /* storage disabled */ } };
+  const saveRead = () => {
+    // Bound storage growth: keep the 1200 most recently marked posts.
+    const entries = Object.entries(read).sort((a, b) => b[1] - a[1]).slice(0, 1200);
+    for (const key of Object.keys(read)) delete read[key];
+    for (const [key, date] of entries) read[key] = date;
+    try { localStorage.setItem(READ_KEY, JSON.stringify(read)); } catch { /* quota */ }
+  };
+
+  function onReadingList() {
+    return /\/(?:u\/\d+\/)?(?:dashboard\/reading|blog\/reading)(?:\/|$)/.test(location.pathname);
+  }
+
+  function validDestination(value, base = location.href) {
+    if (!value || typeof value !== 'string') return null;
+    try {
+      const u = new URL(value, base);
+      if (!['https:', 'http:'].includes(u.protocol) || u.username || u.password) return null;
+      if (!u.hostname || u.hostname === 'localhost') return null;
+      return u.href;
+    } catch { return null; }
+  }
+
+  function isGoogleHost(host) {
+    return /^(?:www\.)?google\.(?:com|cz|sk|de|fr|pl|ca|co\.uk|com\.au)$/.test(host);
+  }
+
+  function unwrapKnownRedirect(href) {
+    const url = new URL(href);
+    const host = url.hostname.toLowerCase();
+    const googleURL = isGoogleHost(host) && url.pathname === '/url';
+    const bloggerRedirect = /^(?:www\.)?blogger\.com$/.test(host) &&
+      /^\/(?:blog-redirect\.g|redirect)(?:\/|$)/.test(url.pathname);
+    if (!googleURL && !bloggerRedirect) return null;
+    for (const param of ['url', 'q', 'u']) {
+      const raw = url.searchParams.get(param);
+      if (!raw || !/^https?:\/\//i.test(raw)) continue;
+      const candidate = validDestination(raw);
+      if (candidate) return candidate;
+    }
+    return null;
+  }
+
+  function isBloggerDashboard(href) {
+    const u = new URL(href);
+    return /^(?:www\.|draft\.)?blogger\.com$/.test(u.hostname) &&
+      /^\/(?:u\/\d+\/)?(?:dashboard|blog|blogger\.g)(?:\/|$)/.test(u.pathname);
+  }
+
+  function destinationFor(anchor) {
+    if (!anchor) return null;
+    const raw = anchor.getAttribute('href');
+    const href = validDestination(raw);
+    if (!href) return null;
+    const unwrapped = unwrapKnownRedirect(href);
+    if (unwrapped) return unwrapped;
+    // A Google redirect without a recoverable URL is deliberately left alone.
+    const u = new URL(href);
+    if (isGoogleHost(u.hostname) && u.pathname === '/url') return null;
+    if (isBloggerDashboard(href)) return null;
+    return href;
+  }
+
+  function relevantAnchor(a) {
+    return !a.closest('nav, header, aside, footer, [role="navigation"], #brr-controls, #brr-search, .brr-actions') &&
+      !/^(?:edit|manage|settings|follow|unfollow|delete)$/i.test((a.textContent || '').trim());
+  }
+
+  // 
+  function hasMultiplePosts(container) {
+    const postLinks = new Set();
+    for (const link of container.querySelectorAll('a[href]')) {
+      const url = destinationFor(link);
+      if (!url) continue;
+      const path = new URL(url).pathname;
+      const looksLikePost = /\/(?:19|20)\d\d\/\d\d\//.test(path) ||
+        /\.html?$/.test(path) ||
+        !!link.closest('h1,h2,h3,h4,[role="heading"]') ||
+        /read more|continue reading|full article/i.test(link.textContent || '');
+      if (looksLikePost) postLinks.add(url.split('#')[0]);
+      if (postLinks.size > 1) return true;
+    }
+    return false;
+  }
+
+  function findCard(a, root) {
+    const known = a.closest('article, [role="article"], [class*="feed-item" i], [class*="reading-list-item" i], [class*="post-card" i], [class*="post-item" i]');
+    if (known && known !== root && (known.textContent || '').trim().length >= 45 &&
+        !hasMultiplePosts(known)) return known;
+
+    // 
+    let chosen = null;
+    let node = a.parentElement;
+    for (let depth = 0; node && node !== root && depth < 11; depth++, node = node.parentElement) {
+      if (!(node instanceof HTMLElement) || node.closest('#brr-controls, #brr-search')) break;
+      if (node.querySelector('[data-brr-card]')) break;
+      const textLength = (node.textContent || '').trim().length;
+      const count = node.querySelectorAll('a[href]').length;
+      const height = node.getBoundingClientRect().height;
+      if (count > 16 || textLength > 8000 || height > 1400 || hasMultiplePosts(node)) break;
+      if (textLength >= 45 && count <= 16 &&
+          (height === 0 || (height >= 45 && height <= 1200))) chosen = node;
+    }
+    return chosen;
+  }
+
+  function scoreAnchor(anchor) {
+    const dest = destinationFor(anchor);
+    if (!dest || !relevantAnchor(anchor)) return -999;
+    const label = (anchor.innerText || anchor.textContent || '').trim();
+    const path = new URL(dest).pathname;
+    let score = 0;
+    if (/\/(?:19|20)\d\d\/\d\d\//.test(path)) score += 50;
+    if (/\.(html?|aspx?)(?:$)/i.test(path)) score += 15;
+    if (/read more|view (?:full )?post|continue reading|full article|read full/i.test(label)) score += 60;
+    if (anchor.closest('h1, h2, h3, h4, [role="heading"]')) score += 70;
+    if (label.length >= 18 && label.length <= 180) score += 20;
+    if (label.length < 4) score -= 35;
+    if (/^(home|blog|profile|author|source|follow)$/i.test(label)) score -= 90;
+    return score;
+  }
+
+  function getBestPostLink(card) {
+    const links = Array.from(card.querySelectorAll('a[href]')).filter(relevantAnchor);
+    links.sort((a, b) => scoreAnchor(b) - scoreAnchor(a));
+    const best = links[0];
+    return best && scoreAnchor(best) >= 0 ? { anchor: best, url: destinationFor(best) } : null;
+  }
+
+  function markCard(card, url, shouldMark) {
+    if (shouldMark) read[url] = Date.now();
+    else delete read[url];
+    saveRead();
+    card.dataset.brrRead = shouldMark ? 'true' : 'false';
+    const btn = card.querySelector('.brr-mark');
+    if (btn) btn.textContent = shouldMark ? '✓ Read' : 'Mark read';
+    applyFilters();
+  }
+
+  function openDirect(url, card) {
+    // Only called from an actual user click; never auto-follows a redirect notice.
+    window.open(url, '_blank', 'noopener,noreferrer');
+    if (card) markCard(card, url, true);
+  }
+
+  function enhance(card, data) {
+    if (card.hasAttribute('data-brr-card')) return;
+    card.dataset.brrCard = '';
+    card.dataset.brrUrl = data.url;
+    card.dataset.brrRead = read[data.url] ? 'true' : 'false';
+    data.anchor.dataset.brrPrimary = 'true';
+    // 
+    card.style.removeProperty('opacity');
+
+    const actions = document.createElement('div');
+    actions.className = 'brr-actions';
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'brr-open';
+    open.textContent = '↗ Open original';
+    open.title = `Open original post: ${new URL(data.url).hostname}`;
+    open.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openDirect(data.url, card);
+    });
+    const mark = document.createElement('button');
+    mark.type = 'button';
+    mark.className = 'brr-mark';
+    mark.textContent = read[data.url] ? '✓ Read' : 'Mark read';
+    mark.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      markCard(card, data.url, !read[data.url]);
+    });
+    actions.append(open, mark);
+    card.append(actions);
+  }
+
+  const style = document.createElement('style');
+  style.id = 'brr-style';
+  style.textContent = `
+    /* Palette: paper, oat, sage and dusty rose. */
+    body.brr-clean {
+      --brr-paper: #fffdf8;
+      --brr-ink: #3d4b47;
+      --brr-muted: #747e78;
+      --brr-line: #e7ded5;
+      --brr-sage: #708f80;
+      --brr-sage-light: #e6efe8;
+      --brr-rose: #f3e3dd;
+      background-color: #f7f3ec !important;
+    }
+    /* Use a locally stored data URL first. The Pinterest link is fallback only.
+       This avoids third-party hotlinking once the user imports the JPG. */
+    /* Actual full-screen wallpaper. The normal layer sits behind Blogger's feed;
+       the always-visible layer solves Blogger's opaque nested containers. */
+    #brr-wallpaper {
+      display: none;
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image: linear-gradient(rgba(251,247,241,.39), rgba(251,247,241,.39)),
+        var(--brr-pattern-image, url("https://i.pinimg.com/1200x/52/d8/e6/52d8e6922222082948e5290da89a1734.jpg"));
+      background-position: top left, top left;
+      background-repeat: repeat, repeat;
+      background-size: auto, 320px auto;
+      z-index: 0;
+      opacity: 1;
+    }
+    body.brr-pattern #brr-wallpaper { display: block; }
+    /* The optional visible texture sits over Blogger's blank surfaces, but
+       never over the actual reading content or its solid post bubbles. */
+    body.brr-force-pattern #brr-wallpaper {
+      background-image: var(--brr-pattern-image, url("https://i.pinimg.com/1200x/52/d8/e6/52d8e6922222082948e5290da89a1734.jpg"));
+      background-size: 320px auto;
+      background-repeat: repeat;
+      opacity: .34;
+      mix-blend-mode: multiply;
+      z-index: 2147482000;
+    }
+    body.brr-pattern .brr-clear-surface {
+      background: transparent !important;
+      background-color: transparent !important;
+      background-image: none !important;
+    }
+    body.brr-force-pattern :is(main, [role="main"], .mat-drawer-content,
+      .mat-sidenav-content, .mdl-layout__content) {
+      position: relative !important;
+      z-index: 2147482100 !important;
+    }
+
+    /* The floating control is a light, small pill, not a dark settings bar. */
+    #brr-controls {
+      --brr-ctl-ink: #495c53;
+      --brr-ctl-muted: #78867c;
+      --brr-ctl-line: #e6ddd3;
+      position: fixed;
+      right: 22px;
+      bottom: 20px;
+      z-index: 2147483600;
+      color: var(--brr-ctl-ink);
+      font: 13px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+    #brr-controls[hidden], #brr-panel[hidden] { display: none !important; }
+    #brr-controls * { box-sizing: border-box; }
+    #brr-controls button { font-family: inherit; cursor: pointer; }
+    #brr-controls button:focus-visible { outline: 3px solid #93b6a8; outline-offset: 3px; }
+    #brr-controls .brr-launcher {
+      display: flex; align-items: center; justify-content: center; gap: 9px;
+      margin-left: auto; padding: 11px 15px;
+      min-height: 44px;
+      border: 1px solid #e8dcd0; border-radius: 100px;
+      background: rgba(255,251,244,.96); color: #526e60;
+      box-shadow: 0 5px 18px rgba(84,66,52,.12);
+      font-size: 13px; font-weight: 650;
+      backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+      transition: background .2s, transform .2s, box-shadow .2s;
+    }
+    #brr-controls .brr-launcher:hover {
+      background: #fffef9; transform: translateY(-2px);
+      box-shadow: 0 7px 23px rgba(84,66,52,.17);
+    }
+    #brr-controls .brr-flower { color: #c98f90; font-size: 17px; line-height: 1; }
+    #brr-controls .brr-sliders { font-size: 16px; color: #8a9b90; font-weight: 400; }
+    #brr-panel {
+      position: absolute; right: 0; bottom: calc(100% + 12px);
+      width: min(320px, calc(100vw - 24px)); max-height: min(590px, calc(100dvh - 104px));
+      overflow-y: auto; padding: 20px; border: 1px solid #e6dacf;
+      border-radius: 21px; background: rgba(255,252,247,.98);
+      box-shadow: 0 16px 55px rgba(88,70,59,.17);
+      backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+    }
+    #brr-controls .brr-panel-top { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+    #brr-controls .brr-eyebrow { color: #9a817d; text-transform: uppercase; letter-spacing: .10em; font-size: 10px; font-weight: 750; }
+    #brr-controls .brr-title { display:block; margin: 3px 0 0; font: 650 23px/1.2 Georgia, 'Times New Roman', serif; color:#43584d; }
+    #brr-controls .brr-close {
+      border:1px solid #e9ddd2; background:#faf4ed; color:#7e8176;
+      font-size: 18px; width: 31px; height:31px; border-radius: 50%; line-height: 1;
+    }
+    #brr-controls .brr-description { margin: 9px 0 16px; color: #7f867f; font-size: 12px; }
+    #brr-controls .brr-settings { display:flex; flex-direction:column; gap:8px; }
+    #brr-controls .brr-setting {
+      display:flex; justify-content:space-between; align-items:center; gap:14px;
+      padding: 11px 12px; width: 100%; text-align:left;
+      border:1px solid #ece4db; border-radius: 13px;
+      background:#fffcf8; color:#465a50;
+      transition:background .15s, border-color .15s;
+    }
+    #brr-controls .brr-setting:hover { background:#f7f1ea; border-color:#dcd5c7; }
+    #brr-controls .brr-setting-label { font-size:13px; font-weight:650; }
+    #brr-controls .brr-setting small { display:block; margin-top:2px; font-size:11px; font-weight:400; color:#889087; }
+    #brr-controls .brr-state {
+      flex-shrink:0; display:inline-flex; align-items:center; justify-content:center;
+      min-width: 41px; padding: 5px 8px; border-radius:100px;
+      background:#eeeae3; color:#86867b; font:700 11px system-ui,sans-serif;
+    }
+    #brr-controls .brr-setting[aria-pressed="true"] .brr-state { background:#e1eee5; color:#567f67; }
+    #brr-controls .brr-footer {
+      display:flex; justify-content:space-between; gap:8px; align-items:center;
+      margin-top: 15px; border-top:1px solid #ece3da; padding-top: 12px;
+      color: #879187; font-size:11px;
+    }
+    #brr-controls .brr-count { font-weight:700; color:#697d71; }
+
+    /* Locally imported background controls. */
+    #brr-controls .brr-import {
+      display:flex; flex-direction:column; gap:8px; padding:12px;
+      background: #f9f4ee; border:1px solid #e9dfd5; border-radius:14px;
+    }
+    #brr-controls .brr-import-header { color:#50665a; font-size:12px; font-weight:680; }
+    #brr-controls .brr-import-description { color:#7e847a; font-size:11px; line-height:1.55; }
+    #brr-controls .brr-import-buttons { display:flex; flex-wrap:wrap; gap:7px; }
+    #brr-controls .brr-import-button, #brr-controls .brr-clear-image {
+      padding:8px 12px; border-radius:100px; font-size:12px; font-weight:650;
+      border:1px solid #cbdccf; background:#e2eee5; color:#506f5b;
+    }
+    #brr-controls .brr-clear-image { background:#fffaf5; border-color:#e6d9ce; color:#957f79; }
+    #brr-controls .brr-image-status { color:#697a6d; font-size:11px; line-height:1.45; }
+    #brr-controls .brr-image-status[data-error="true"] { color:#a85655; }
+    #brr-controls .brr-image-preview {
+      display:none; min-height:54px; max-height:100px; border:1px solid #e5d9cf;
+      border-radius:9px; background-repeat:repeat; background-size:100px auto;
+    }
+    #brr-controls .brr-image-preview[data-ready="true"] { display:block; }
+    #brr-controls .brr-image-file { display:none !important; }
+
+    /* Real, separate, fully opaque cards (including posts already marked read). */
+    body.brr-clean [data-brr-card] {
+      --brr-bg: #fffdf9;
+      --brr-fg: #303e3a;
+      --brr-muted: #67766d;
+      --brr-border: #dfd8ce;
+      box-sizing: border-box !important;
+      position: relative !important;
+      isolation: isolate;
+      z-index: 2147482500 !important;
+      background: var(--brr-bg) !important;
+      background-image: none !important;
+      color: var(--brr-fg) !important;
+      opacity: 1 !important;
+      border: 1px solid var(--brr-border) !important;
+      border-radius: 20px !important;
+      margin: 20px 12px 24px !important;
+      padding: 24px 27px !important;
+      box-shadow: 0 9px 28px rgba(62,48,38,.14) !important;
+      line-height: 1.75 !important;
+      max-width: 920px;
+      transition: border-color .2s, box-shadow .2s;
+    }
+    /* Blogger sometimes supplies white backgrounds INSIDE the post wrapper. */
+    body.brr-theme-dark.brr-clean [data-brr-card] :is(div, section, p, blockquote) {
+      background-color: transparent !important;
+      background-image: none !important;
+    }
+    body.brr-clean [data-brr-card]:hover {
+      border-color: #c7d6c9 !important;
+      box-shadow:0 9px 30px rgba(87,70,52,.11) !important;
+    }
+    body.brr-clean [data-brr-card] a { text-decoration-thickness:1px; text-underline-offset: 3px; }
+    body.brr-clean [data-brr-card] [data-brr-primary="true"] {
+      color: #526e60 !important; font-weight:680 !important;
+      font-size:clamp(17px, 1.7vw, 21px) !important;
+      line-height:1.35 !important; text-decoration:none !important;
+    }
+    body.brr-clean [data-brr-card] [data-brr-primary="true"]:hover { text-decoration: underline !important; }
+    body.brr-clean [data-brr-card] img { max-width:100%; height:auto; border-radius:11px; }
+    body.brr-clean [data-brr-card] p { line-height:1.75; }
+    body .brr-actions {
+      display:flex; align-items:center; flex-wrap:wrap;
+      gap:9px; margin-top:17px; padding-top:14px;
+      border-top:1px solid var(--brr-border, #e7ded4);
+    }
+    body .brr-actions button {
+      background:#faf6ef; font:600 12px system-ui, sans-serif;
+      border:1px solid #e9e0d6; color:#788177;
+      border-radius:100px; padding:9px 14px; cursor:pointer;
+      transition: background .15s, border-color .15s;
+    }
+    body .brr-actions .brr-open { background:#e3eee6; border-color:#d2e2d7; color:#4a705a; }
+    body .brr-actions .brr-open:hover { background:#d3e5d7; }
+    body .brr-actions .brr-mark:hover { background:#f3e7df; }
+
+    /* Readable dark mode: fully solid charcoal cards and light body text,
+       overriding Blogger's own gray/dark text and inner white panels. */
+    body.brr-theme-dark.brr-clean { background-color: #131c23 !important; }
+    body.brr-theme-dark.brr-clean [data-brr-card] {
+      --brr-bg: #202c36;
+      --brr-fg: #f2f5f7;
+      --brr-muted: #d0d9de;
+      --brr-border: #53626c;
+      box-shadow: 0 10px 34px rgba(0,0,0,.32) !important;
+    }
+    body.brr-theme-dark.brr-clean [data-brr-card] :is(
+      div, span, p, section, li, small, time, strong, em,
+      blockquote, h1, h2, h3, h4, h5, h6, [role="heading"]
+    ) { color: #eef3f6 !important; }
+    body.brr-theme-dark.brr-clean [data-brr-card] :is(
+      [class*="muted" i], [class*="secondary" i], [class*="date" i]
+    ) { color: #d1dbe0 !important; }
+    body.brr-theme-dark.brr-clean [data-brr-card] a,
+    body.brr-theme-dark.brr-clean [data-brr-card] a :is(span, strong, em) {
+      color: #bbebd4 !important;
+    }
+    body.brr-theme-dark.brr-clean [data-brr-card] [data-brr-primary="true"],
+    body.brr-theme-dark.brr-clean [data-brr-card] [data-brr-primary="true"] * {
+      color: #d5f4e1 !important;
+    }
+    body.brr-theme-dark.brr-clean [data-brr-card] .brr-actions { border-color: #50616a; }
+    body.brr-theme-dark.brr-clean [data-brr-card] .brr-actions button {
+      background: #33444f; border-color: #647882; color: #f2f7f8 !important;
+    }
+    body.brr-theme-dark.brr-clean [data-brr-card] .brr-actions .brr-open {
+      background: #375e50; border-color: #588e77; color: #f0fff6 !important;
+    }
+    body.brr-hide-read [data-brr-card][data-brr-read="true"],
+    [data-brr-card][data-brr-filtered="true"] { display: none !important; }
+    body.brr-clean [data-brr-card][data-brr-read="true"] {
+      opacity: 1 !important; border-left: 4px solid #9cb9a6 !important;
+    }
+    /* Fast search floats over the feed, not inside any individual card. */
+    #brr-search {
+      box-sizing: border-box; position: fixed; top: 78px; right: 22px;
+      z-index: 2147483500; width: min(390px, calc(100vw - 24px));
+      background: #fffdf9; border: 1px solid #ded8ce; color: #344940;
+      border-radius: 17px; box-shadow: 0 9px 32px rgba(53,42,33,.19);
+      padding: 12px; font: 13px/1.4 system-ui, -apple-system, Segoe UI, sans-serif;
+    }
+    #brr-search[hidden], #brr-search .brr-search-clear[hidden] { display: none !important; }
+    #brr-search * { box-sizing: border-box; }
+    #brr-search .brr-search-title { display: block; font-weight: 750; margin: 0 0 8px; }
+    #brr-search .brr-search-row { display: flex; align-items: center; gap: 6px; }
+    #brr-search input, #brr-search select {
+      min-width: 0; height: 37px; border: 1px solid #d5d9d1;
+      border-radius: 10px; background: #fff; color: #253b33;
+      font: 13px system-ui, sans-serif;
+    }
+    #brr-search input { flex: 1; width: 100%; padding: 0 10px; }
+    #brr-search select { width: 125px; padding: 0 6px; cursor: pointer; }
+    #brr-search .brr-search-clear {
+      flex: 0 0 auto; width: 34px; height: 37px; cursor: pointer;
+      background: #f6eee8; border: 1px solid #ded9cf; border-radius: 10px;
+      color: #56635b; font-size: 20px;
+    }
+    #brr-search :is(input, select, button):focus-visible {
+      outline: 3px solid #8daea3; outline-offset: 2px;
+    }
+    #brr-search .brr-search-status { display:block; margin-top: 8px; font-size: 11px; color:#64766d; }
+    #brr-search .brr-search-tip { display:block; font-size: 10px; color:#7b8b80; margin-top: 3px; }
+
+    /* The settings panel also switches to light-on-dark in evening mode. */
+    body.brr-theme-dark #brr-search,
+    body.brr-theme-dark #brr-panel,
+    body.brr-theme-dark #brr-controls .brr-launcher {
+      background: #24323b; color: #f1f5f7; border-color: #54616b;
+    }
+    body.brr-theme-dark #brr-controls :is(.brr-title, .brr-description,
+      .brr-eyebrow, .brr-footer, .brr-count, .brr-import-header,
+      .brr-import-description, .brr-image-status) { color: #e5edef !important; }
+    body.brr-theme-dark #brr-controls .brr-setting,
+    body.brr-theme-dark #brr-controls .brr-import {
+      background: #2c3b45; color: #f1f5f7; border-color: #53646c;
+    }
+    body.brr-theme-dark #brr-controls .brr-setting small,
+    body.brr-theme-dark #brr-search :is(.brr-search-status, .brr-search-tip) { color:#c8d6dc; }
+    body.brr-theme-dark #brr-controls .brr-setting:hover { background: #364954; }
+    body.brr-theme-dark #brr-search :is(input, select) {
+      background: #17242d; color: #f3f6f7; border-color:#687985;
+    }
+    body.brr-theme-dark #brr-search input::placeholder { color: #bbcbd2; }
+    body.brr-theme-dark #brr-search .brr-search-clear,
+    body.brr-theme-dark #brr-controls .brr-close {
+      background: #42535d; color:#f6fafb; border-color:#697982;
+    }
+    body.brr-theme-dark #brr-controls .brr-setting .brr-state {
+      background:#50606a; color:#f4f7f9;
+    }
+    body.brr-theme-dark #brr-controls .brr-setting[aria-pressed="true"] .brr-state {
+      background:#416b58; color:#f3fff6;
+    }
+    @media (max-width:650px) {
+      #brr-controls { right:12px; bottom:12px; }
+      #brr-panel { width:min(320px, calc(100vw - 24px)); }
+      #brr-search { top: 66px; right: 12px; padding: 10px; }
+      #brr-search select { width: 108px; }
+      body.brr-clean [data-brr-card] {
+        padding: 17px 18px !important; margin: 17px 8px 22px !important;
+      }
+    }
+    @media (prefers-reduced-motion:reduce) {
+      #brr-controls .brr-launcher, body.brr-clean [data-brr-card] { transition:none; }
+    }
+  `;
+
+  let controls = null;
+  let searchBar = null;
+  let scanTimer = null;
+  const search = { query: '', field: 'all' };
+
+  function normalize(text) {
+    return String(text || '').normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '').toLocaleLowerCase().trim();
+  }
+
+  function searchTerms(value) {
+    // Plain words are ANDed; quoted text is kept as one phrase.
+    const terms = [];
+    for (const part of value.matchAll(/"([^"]+)"|(\S+)/g)) {
+      const term = normalize(part[1] || part[2]);
+      if (term) terms.push(term);
+    }
+    return terms;
+  }
+
+  function cardSearchFields(card) {
+    const text = card.textContent || '';
+    const title = Array.from(card.querySelectorAll(
+      '[data-brr-primary], h1, h2, h3, h4, [role="heading"]'
+    )).map(el => el.textContent || '').join(' ');
+    const tags = Array.from(card.querySelectorAll(
+      '[rel="tag"], [itemprop="keywords"], [class*="topic" i], ' +
+      '[class*="tag" i], [class*="label" i], a[href*="/search/label/"]'
+    )).map(el => el.textContent || '').join(' ');
+    const authors = Array.from(card.querySelectorAll(
+      '[rel="author"], [itemprop="author"], [class*="author" i], ' +
+      '[class*="byline" i], [class*="poster" i], [class*="blog-name" i], ' +
+      '[class*="blog-title" i], [class*="source-name" i], ' +
+      '[class*="publisher" i], a[href*="/profile/"]'
+    )).map(el => el.textContent || '').join(' ');
+    let domain = '';
+    try { domain = new URL(card.dataset.brrUrl).hostname.replace(/^www\./, ''); }
+    catch { /* not a valid URL */ }
+    return {
+      all: normalize(`${text} ${domain}`),
+      keywords: normalize(text),
+      topic: normalize(`${title} ${tags}`),
+      author: normalize(`${authors} ${domain}`)
+    };
+  }
+
+  function updateCounter(cards = document.querySelectorAll('[data-brr-card]')) {
+    if (!controls) return;
+    const total = cards.length;
+    const done = Array.from(cards).filter(c => c.dataset.brrRead === 'true').length;
+    const counter = controls.querySelector('.brr-count');
+    const label = `${done}/${total} read`;
+    if (counter && counter.textContent !== label) counter.textContent = label;
+  }
+
+  function applyFilters() {
+    if (!onReadingList()) return;
+    const cards = document.querySelectorAll('[data-brr-card]');
+    const terms = searchTerms(search.query);
+    let visible = 0;
+    for (const card of cards) {
+      const haystack = terms.length ? cardSearchFields(card)[search.field] : '';
+      const matches = terms.every(term => haystack.includes(term));
+      card.dataset.brrFiltered = matches ? 'false' : 'true';
+      if (matches && !(options.hideRead && card.dataset.brrRead === 'true')) visible++;
+    }
+    const status = searchBar?.querySelector('.brr-search-status');
+    const label = `${visible} of ${cards.length} loaded posts visible` +
+      (options.hideRead ? ' (read hidden)' : '');
+    if (status && status.textContent !== label) status.textContent = label;
+    const clear = searchBar?.querySelector('.brr-search-clear');
+    if (clear) clear.hidden = !search.query;
+    updateCounter(cards);
+  }
+
+  function refreshPattern() {
+    if (!document.documentElement) return;
+    // Avoid needlessly reapplying a large data URL during feed updates.
+    if (appliedPattern !== storedPattern) {
+      if (storedPattern) {
+        document.documentElement.style.setProperty('--brr-pattern-image', `url("${storedPattern}")`);
+      } else {
+        document.documentElement.style.removeProperty('--brr-pattern-image');
+      }
+      appliedPattern = storedPattern;
+    }
+    if (!controls) return;
+    const status = controls.querySelector('.brr-image-status');
+    const preview = controls.querySelector('.brr-image-preview');
+    const clear = controls.querySelector('.brr-clear-image');
+    if (status && !status.dataset.error) {
+      const next = storedPattern ? '✓ Imported image saved in this browser' : 'Using online image (may be blocked)';
+      // Avoid an endless MutationObserver -> scan -> text replacement cycle.
+      if (status.textContent !== next) status.textContent = next;
+    }
+    if (clear) clear.hidden = !storedPattern;
+    if (preview) {
+      preview.dataset.ready = storedPattern ? 'true' : 'false';
+      preview.style.backgroundImage = storedPattern ? `url("${storedPattern}")` : '';
+    }
+  }
+
+  async function importImage(file) {
+    if (!file) return;
+    const status = controls?.querySelector('.brr-image-status');
+    if (status) {
+      delete status.dataset.error;
+      status.textContent = 'Preparing your pattern…';
+    }
+    try {
+      if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
+        throw new Error('Please choose a JPG, PNG or WebP image.');
+      }
+      if (file.size > 20 * 1024 * 1024) throw new Error('Please choose an image under 20 MB.');
+      const bitmap = await createImageBitmap(file);
+      try {
+        const scale = Math.min(1, 900 / Math.max(bitmap.width, bitmap.height));
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+        canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+        const ctx = canvas.getContext('2d');
+        if (!ctx) throw new Error('Could not prepare the image on this browser.');
+        ctx.fillStyle = '#f7f3ec';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        const image = canvas.toDataURL('image/jpeg', 0.83);
+        // Avoid excessive storage use, even if the original image is large.
+        if (image.length > 4000000) throw new Error('Image is still too large to save. Try a smaller JPG.');
+        localStorage.setItem(IMAGE_KEY, image);
+        storedPattern = image;
+      } finally {
+        if (typeof bitmap.close === 'function') bitmap.close();
+      }
+      refreshPattern();
+      if (status) {
+        delete status.dataset.error;
+        status.textContent = '✓ Imported! The image will repeat behind your feed.';
+      }
+    } catch (error) {
+      if (status) {
+        status.dataset.error = 'true';
+        status.textContent = error?.message || 'The image could not be imported.';
+      }
+    }
+  }
+
+  function refreshUI() {
+    if (!document.body) return;
+    const reading = onReadingList();
+    if (controls) controls.hidden = !reading;
+    if (searchBar) searchBar.hidden = !reading;
+    document.body.classList.toggle('brr-clean', reading && options.clean);
+    document.body.classList.toggle('brr-pattern', reading && options.pattern);
+    document.body.classList.toggle('brr-force-pattern', reading && options.pattern && options.visiblePattern);
+    document.body.classList.toggle('brr-theme-dark', reading && options.dark);
+    document.body.classList.toggle('brr-hide-read', reading && options.hideRead);
+    refreshPattern();
+    if (!controls) return;
+    for (const id of Object.keys(DEFAULTS)) {
+      const btn = controls.querySelector(`[data-option="${id}"]`);
+      if (!btn) continue;
+      btn.setAttribute('aria-pressed', String(!!options[id]));
+      const pill = btn.querySelector('.brr-state');
+      const label = options[id] ? 'On' : 'Off';
+      if (pill && pill.textContent !== label) pill.textContent = label;
+    }
+    applyFilters();
+  }
+
+  function setup() {
+    if (!document.body || controls) return;
+    document.head.append(style);
+    if (!document.querySelector('#brr-wallpaper')) {
+      const wallpaper = document.createElement('div');
+      wallpaper.id = 'brr-wallpaper';
+      wallpaper.setAttribute('aria-hidden', 'true');
+      document.body.prepend(wallpaper);
+    }
+    controls = document.createElement('div');
+    controls.id = 'brr-controls';
+    controls.setAttribute('role', 'region');
+    controls.setAttribute('aria-label', 'Reading List Cleaner settings');
+    controls.innerHTML = `
+      <button class="brr-launcher" type="button" aria-controls="brr-panel" aria-expanded="false"
+              aria-label="Customize Reading List">
+        <span class="brr-flower" aria-hidden="true">✿</span>
+        <span>Reading List</span>
+        <span class="brr-sliders" aria-hidden="true">☷</span>
+      </button>
+      <div id="brr-panel" role="group" aria-label="Reading List appearance settings" hidden>
+        <div class="brr-panel-top">
+          <div><div class="brr-eyebrow">Make it yours</div><strong class="brr-title">Reading nook</strong></div>
+          <button class="brr-close" type="button" aria-label="Close settings">×</button>
+        </div>
+        <p class="brr-description">Custom reader list</p>
+        <div class="brr-settings">
+          <button type="button" class="brr-setting" data-option="clean" aria-pressed="true">
+            <span class="brr-setting-label">Soft layout<small>Comfortable cards and typography</small></span>
+            <span class="brr-state">On</span>
+          </button>
+          <button type="button" class="brr-setting" data-option="pattern" aria-pressed="true">
+            <span class="brr-setting-label">Pattern background<small>Repeating mosaic, gently faded</small></span>
+            <span class="brr-state">On</span>
+          </button>
+          <div class="brr-import">
+            <div class="brr-import-header">Your background image</div>
+            <div class="brr-import-description">Pinterest may block direct image links. Save the JPG, then import it once. It stays in this browser.</div>
+            <div class="brr-import-buttons">
+              <button type="button" class="brr-import-button">Choose image…</button>
+              <button type="button" class="brr-clear-image" hidden>Remove</button>
+            </div>
+            <input class="brr-image-file" type="file" accept="image/jpeg,image/png,image/webp" aria-label="Choose repeating background image">
+            <div class="brr-image-status" role="status" aria-live="polite">Using online image (may be blocked)</div>
+            <div class="brr-image-preview" role="img" aria-label="Background image preview"></div>
+          </div>
+          <button type="button" class="brr-setting" data-option="visiblePattern" aria-pressed="true">
+            <span class="brr-setting-label">Always-visible pattern<small>Shows the design through Blogger's white panels</small></span>
+            <span class="brr-state">On</span>
+          </button>
+          <button type="button" class="brr-setting" data-option="dark" aria-pressed="false">
+            <span class="brr-setting-label">Evening colors<small>Warm and muted, never jet-black</small></span>
+            <span class="brr-state">Off</span>
+          </button>
+          <button type="button" class="brr-setting" data-option="hideRead" aria-pressed="false">
+            <span class="brr-setting-label">Hide read posts<small>Keep only your unread items visible</small></span>
+            <span class="brr-state">Off</span>
+          </button>
+        </div>
+        <div class="brr-footer"><span class="brr-count">0/0 read</span><span>✿ Happy reading</span></div>
+      </div>`;
+    const input = controls.querySelector('.brr-image-file');
+    controls.querySelector('.brr-import-button').addEventListener('click', () => input.click());
+    input.addEventListener('change', () => {
+      const file = input.files?.[0];
+      input.value = '';
+      if (file) void importImage(file);
+    });
+    controls.querySelector('.brr-clear-image').addEventListener('click', () => {
+      try { localStorage.removeItem(IMAGE_KEY); } catch { /* storage restricted */ }
+      storedPattern = null;
+      const status = controls.querySelector('.brr-image-status');
+      if (status) delete status.dataset.error;
+      refreshPattern();
+    });
+    const launcher = controls.querySelector('.brr-launcher');
+    const panel = controls.querySelector('#brr-panel');
+    const setOpen = open => {
+      panel.hidden = !open;
+      launcher.setAttribute('aria-expanded', String(open));
+    };
+    launcher.addEventListener('click', () => setOpen(panel.hidden));
+    controls.querySelector('.brr-close').addEventListener('click', () => {
+      setOpen(false);
+      launcher.focus();
+    });
+    for (const key of Object.keys(DEFAULTS)) {
+      controls.querySelector(`[data-option="${key}"]`).addEventListener('click', () => {
+        options[key] = !options[key];
+        saveOptions();
+        refreshUI();
+      });
+    }
+    document.addEventListener('pointerdown', e => {
+      if (!panel.hidden && !controls.contains(e.target)) setOpen(false);
+    }, {passive:true});
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape' && !panel.hidden) {
+        setOpen(false);
+        launcher.focus();
+      }
+    });
+    document.body.append(controls);
+
+    searchBar = document.createElement('div');
+    searchBar.id = 'brr-search';
+    searchBar.setAttribute('role', 'search');
+    searchBar.setAttribute('aria-label', 'Filter Blogger reading list');
+    searchBar.innerHTML = `
+      <label class="brr-search-title" for="brr-search-input">⌕ Find a post</label>
+      <div class="brr-search-row">
+        <input id="brr-search-input" type="search" autocomplete="off"
+          placeholder="Search reading list…" aria-label="Search reading list">
+        <select aria-label="Search in">
+          <option value="all">Everything</option>
+          <option value="topic">Topic / tags</option>
+          <option value="keywords">Keywords</option>
+          <option value="author">Author / blog</option>
+        </select>
+        <button class="brr-search-clear" type="button" hidden aria-label="Clear search">×</button>
+      </div>
+      <span class="brr-search-status" role="status" aria-live="polite">0 posts found</span>
+      <span class="brr-search-tip">Searches posts Blogger has loaded; scroll to load more.</span>`;
+    const searchInput = searchBar.querySelector('input');
+    searchInput.addEventListener('input', () => {
+      search.query = searchInput.value;
+      applyFilters();
+    });
+    searchBar.querySelector('select').addEventListener('change', e => {
+      search.field = e.target.value;
+      applyFilters();
+    });
+    searchBar.querySelector('.brr-search-clear').addEventListener('click', () => {
+      search.query = '';
+      searchInput.value = '';
+      applyFilters();
+      searchInput.focus();
+    });
+    document.body.append(searchBar);
+    refreshUI();
+  }
+
+  function exposeOpaqueLayers() {
+    // Also supports the behind-the-content mode. Only expose big layout surfaces,
+    // never individual post cards, controls, buttons or sidebar elements.
+    const root = document.querySelector('main, [role="main"], .mat-drawer-content, .mat-sidenav-content, .mdl-layout__content');
+    if (!root) return;
+    for (let node = root; node && node !== document.body; node = node.parentElement) {
+      if (node instanceof HTMLElement) node.classList.add('brr-clear-surface');
+    }
+    const minW = Math.min(300, innerWidth * .65);
+    const nodes = [root, ...Array.from(root.querySelectorAll('*')).slice(0, 1200)];
+    for (const node of nodes) {
+      if (!(node instanceof HTMLElement)) continue;
+      if (node.closest('#brr-controls, #brr-search, [data-brr-card], article, [role="article"], nav, aside, header, footer, button')) continue;
+      const box = node.getBoundingClientRect();
+      if (box.width >= minW && box.height >= 210) node.classList.add('brr-clear-surface');
+    }
+  }
+
+  function scan() {
+    scanTimer = null;
+    setup();
+    refreshUI();
+    if (!onReadingList()) return;
+    exposeOpaqueLayers();
+    const root = document.querySelector('main, [role="main"]') || document.body;
+    const anchors = Array.from(root.querySelectorAll('a[href]'));
+    for (const a of anchors) {
+      if (!relevantAnchor(a) || scoreAnchor(a) < 15) continue;
+      if (a.closest('[data-brr-card]')) continue;
+      const card = findCard(a, root);
+      if (!card || card.hasAttribute('data-brr-card') ||
+          card.querySelector('[data-brr-card]') ||
+          card.contains(controls) || card.contains(searchBar)) continue;
+      const data = getBestPostLink(card);
+      if (data?.url && scoreAnchor(data.anchor) >= 15) enhance(card, data);
+    }
+    applyFilters();
+  }
+
+  function scheduleScan() {
+    if (scanTimer === null) scanTimer = setTimeout(scan, 160);
+  }
+
+  // Catch the click before Blogger's application handler when the original URL
+  // is visible in the DOM. Leave unsupported / suspicious links untouched.
+  window.addEventListener('click', (event) => {
+    if (!onReadingList() || event.defaultPrevented || event.button !== 0 ||
+        event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    const anchor = event.target instanceof Element ? event.target.closest('a[href]') : null;
+    const card = anchor?.closest('[data-brr-card]');
+    if (!card || !anchor || !relevantAnchor(anchor)) return;
+    const isPrimary = anchor.hasAttribute('data-brr-primary');
+    const isReadMore = /read more|view (?:full )?post|continue reading|full article/i.test(anchor.textContent || '');
+    if (!isPrimary && !isReadMore) return;
+    const target = destinationFor(anchor);
+    if (!target) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    openDirect(target, card);
+  }, true);
+
+  function start() {
+    setup();
+    scan();
+    new MutationObserver(scheduleScan).observe(document.body, { childList: true, subtree: true });
+    window.addEventListener('popstate', scheduleScan);
+    window.addEventListener('hashchange', scheduleScan);
+    // Blogger may use history.pushState without popstate; DOM mutations catch
+    // the normal SPA transition. This low-frequency check handles silent routes.
+    setInterval(() => {
+      const visible = controls && !controls.hidden;
+      if (visible !== onReadingList()) scheduleScan();
+    }, 1800);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start, { once: true });
+  } else start();
+})();
